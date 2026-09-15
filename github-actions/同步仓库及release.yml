@@ -1,0 +1,368 @@
+name: Sync Upstream Repo & Releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: '目标仓库（格式 owner/repo）'
+        required: false
+        default: 'yupianxian9/go-tools'
+        type: string
+      parallelism:
+        description: '附件下载/上传并发数（1-6，推荐 3）'
+        required: false
+        default: '3'
+        type: string
+  # 需要定时同步时取消下面的注释
+  # schedule:
+  #   - cron: '23 4 * * 1'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  # GitHub 单个 release 附件的硬上限：2GB（超过的附件会跳过并记录）
+  ASSET_MAX_BYTES: '2147483648'
+  # 始终保留的磁盘余量：2GB（runner 总盘约 14GB，防止写满导致 runner 崩溃）
+  DISK_RESERVE_BYTES: '2147483648'
+  # 是否同步上游的 draft release
+  INCLUDE_DRAFT: 'false'
+  # 是否删除目标仓库中上游不存在的文件（true = 完全一致镜像）
+  DELETE_EXTRA_FILES: 'true'
+
+jobs:
+  sync:
+    name: sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      # ---------------------------------------------------------------- 0. 准备
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Validate inputs
+        env:
+          INPUT_UPSTREAM: ${{ inputs.upstream_repo || 'Spring691/dawn' }}
+          INPUT_PARALLELISM: ${{ inputs.parallelism || '4' }}
+        run: |
+          set -euo pipefail
+          UPSTREAM="$INPUT_UPSTREAM"
+          PARALLEL="$INPUT_PARALLELISM"
+
+          if ! printf '%s' "$UPSTREAM" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+            echo "::error::upstream_repo 格式非法，应为 owner/repo，当前值：$UPSTREAM"
+            exit 1
+          fi
+          if ! printf '%s' "$PARALLEL" | grep -Eq '^[1-9][0-9]*$'; then
+            echo "::error::parallelism 必须是正整数，当前值：$PARALLEL"
+            exit 1
+          fi
+          if [ "$PARALLEL" -gt 6 ]; then
+            echo "::warning::parallelism=$PARALLEL 过大（runner 仅约 14GB 磁盘），已强制收敛为 6"
+            echo "PARALLEL=6" >> "$GITHUB_ENV"
+          else
+            echo "PARALLEL=$PARALLEL" >> "$GITHUB_ENV"
+          fi
+          echo "UPSTREAM=$UPSTREAM" >> "$GITHUB_ENV"
+          echo "TARGET_BRANCH=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          echo "上游仓库 : $UPSTREAM"
+          echo "并发数量 : $PARALLEL"
+          df -h "$RUNNER_TEMP" || true
+
+      # ------------------------------------------------- 1. 先同步「仓库文件」
+      - name: Sync repository files (git)
+        env:
+          # 上游为私有仓库时，把 secrets.SYNC_TOKEN 配成有上游读权限的 PAT
+          UPSTREAM_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          CLONE_DIR="$RUNNER_TEMP/upstream-repo"
+          rm -rf "$CLONE_DIR"
+
+          echo ">>> 浅克隆上游仓库 $UPSTREAM"
+          git clone --depth 1 --no-tags \
+            "https://x-access-token:${UPSTREAM_TOKEN}@github.com/${UPSTREAM}.git" "$CLONE_DIR"
+          rm -rf "$CLONE_DIR/.git"
+
+          # 保护项：.git 与 .github/workflows（否则会覆盖掉本 workflow 自身）
+          EXCLUDES=(--exclude='.git/' --exclude='.github/workflows/')
+          if [ "$DELETE_EXTRA_FILES" = "true" ]; then
+            EXCLUDES+=(--delete)
+          fi
+
+          rsync -a "${EXCLUDES[@]}" "$CLONE_DIR/" "$GITHUB_WORKSPACE/"
+          rm -rf "$CLONE_DIR"
+          echo ">>> 上游仓库文件已写入工作区，占用：$(du -sh "$GITHUB_WORKSPACE" | cut -f1)"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "初始化并同步仓库"
+            git push origin "HEAD:${TARGET_BRANCH}"
+            echo ">>> 仓库文件已提交并推送"
+          else
+            echo ">>> 仓库文件无变化，跳过提交"
+          fi
+
+      # --------------------------------------- 2. 再同步「Release 及其附件」
+      - name: Sync releases and assets (gh cli)
+        env:
+          UPSTREAM_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          SYNC_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          REPO="$GITHUB_REPOSITORY"
+          WORK="$RUNNER_TEMP/upstream-release-sync"
+          rm -rf "$WORK"
+          ASSET_DIR="$WORK/assets"
+          mkdir -p "$ASSET_DIR"
+          STATE_FILE="$WORK/reserved_bytes"        # 当前已被并发任务预留的字节数
+          LOCK_FILE="$WORK/space.lock"
+          RESULT_LOG="$WORK/results.log"
+          echo 0 > "$STATE_FILE"
+          : > "$LOCK_FILE"
+          : > "$RESULT_LOG"
+
+          log()  { printf '[%s] %s\n' "$(date -u '+%H:%M:%S')" "$*"; }
+          hsize(){ numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1"; }
+          avail_bytes() { df -P -B1 "$WORK" | awk 'NR==2{print $4}'; }
+
+          # 全局磁盘配额：并发任务共享，空间不够就排队等待（不会把 14GB 写爆）
+          reserve_space() {
+            local need="$1"
+            local deadline=$(( $(date +%s) + 3600 ))
+            exec 9>>"$LOCK_FILE"
+            while :; do
+              flock 9
+              local avail used
+              avail=$(avail_bytes)
+              used=$(cat "$STATE_FILE")
+              if [ "$(( used + need ))" -le "$(( avail - DISK_RESERVE_BYTES ))" ]; then
+                echo "$(( used + need ))" > "$STATE_FILE"
+                flock -u 9; exec 9>&-
+                return 0
+              fi
+              flock -u 9
+              if [ "$(date +%s)" -ge "$deadline" ]; then exec 9>&-; return 1; fi
+              sleep 10
+            done
+          }
+          release_space() {
+            local need="$1" used v
+            exec 9>>"$LOCK_FILE"
+            flock 9
+            used=$(cat "$STATE_FILE")
+            v=$(( used - need )); [ "$v" -lt 0 ] && v=0
+            echo "$v" > "$STATE_FILE"
+            flock -u 9; exec 9>&-
+          }
+          record() { printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" >> "$RESULT_LOG"; }
+
+          # 单个附件：下载 -> 上传 -> 删除 -> 归还磁盘配额
+          handle_asset() {
+            local tag="$1" id="$2" size="$3" name="$4"
+            local dir="$ASSET_DIR/$id"
+            local out="$dir/$name"
+            local reserved=0
+            mkdir -p "$dir"
+            # 无论成败都必须删文件；只有真正拿到配额才归还配额
+            trap 'rm -rf "$dir"; if [ "$reserved" -eq 1 ]; then release_space "$size"; fi' EXIT
+
+            if [ "$size" -gt "$ASSET_MAX_BYTES" ]; then
+              record SKIP "$tag" "$name" "$size" "超过 GitHub 2GB 附件上限"
+              return 0
+            fi
+            if [ "$(( size + DISK_RESERVE_BYTES ))" -gt "$(avail_bytes)" ]; then
+              record SKIP "$tag" "$name" "$size" "磁盘剩余空间不足以容纳该附件"
+              return 0
+            fi
+            if ! reserve_space "$size"; then
+              record FAIL "$tag" "$name" "$size" "等待磁盘空间超时"
+              return 1
+            fi
+            reserved=1
+
+            # --- 下载 ---
+            local downloaded=0 i
+            for i in 1 2 3; do
+              if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 \
+                   -H "Authorization: Bearer ${UPSTREAM_TOKEN}" \
+                   -H "Accept: application/octet-stream" \
+                   -H "X-GitHub-Api-Version: 2022-11-28" \
+                   -o "$out" \
+                   "https://api.github.com/repos/${UPSTREAM}/releases/assets/${id}" < /dev/null; then
+                downloaded=1; break
+              fi
+              sleep 5
+            done
+            if [ "$downloaded" -ne 1 ]; then
+              record FAIL "$tag" "$name" "$size" "下载失败"
+              return 1
+            fi
+
+            # --- 上传 ---
+            local uploaded=0
+            for i in 1 2 3; do
+              if GH_TOKEN="$SYNC_TOKEN" gh release upload "$tag" "$out" --repo "$REPO" < /dev/null; then
+                uploaded=1; break
+              fi
+              # 已存在同名附件视为成功（重试/并发导致的重复上传）
+              if GH_TOKEN="$SYNC_TOKEN" gh release view "$tag" --repo "$REPO" \
+                   --json assets --jq '.assets[].name' < /dev/null 2>/dev/null \
+                   | grep -Fqx -- "$name"; then
+                uploaded=1; break
+              fi
+              sleep 10
+            done
+
+            if [ "$uploaded" -eq 1 ]; then
+              record OK "$tag" "$name" "$size" ""
+            else
+              record FAIL "$tag" "$name" "$size" "上传失败"
+            fi
+          }
+
+          # ---------- 拉取上游 release 列表并按版本号自然排序（低 -> 高）----------
+          log "拉取上游 release 列表：$UPSTREAM"
+          : > "$WORK/tags.raw"
+          GH_TOKEN="$UPSTREAM_TOKEN" gh api --paginate \
+            "repos/${UPSTREAM}/releases?per_page=100" \
+            --jq '.[] | .tag_name' < /dev/null > "$WORK/tags.raw" || true
+          sort -V "$WORK/tags.raw" | awk 'NF' > "$WORK/tags.txt"
+
+          total_releases=$(wc -l < "$WORK/tags.txt" | tr -d ' ')
+          log "共发现 $total_releases 个 release"
+          created_releases=0; updated_releases=0
+
+          while IFS= read -r tag <&3; do
+            [ -z "$tag" ] && continue
+            log "================ Release: $tag ================"
+            enc=$(printf '%s' "$tag" | jq -sRr @uri)
+            if ! GH_TOKEN="$UPSTREAM_TOKEN" gh api "repos/${UPSTREAM}/releases/tags/${enc}" \
+                   < /dev/null > "$WORK/rel.json" 2>"$WORK/rel.err"; then
+              log "警告：无法读取上游 release $tag，跳过（$(head -c 200 "$WORK/rel.err")）"
+              continue
+            fi
+
+            title=$(jq -r '.name // ""' "$WORK/rel.json")
+            if [ -z "$title" ] || [ "$title" = "null" ]; then title="$tag"; fi
+            prerelease=$(jq -r '.prerelease' "$WORK/rel.json")
+            draft=$(jq -r '.draft' "$WORK/rel.json")
+            jq -r '.body // ""' "$WORK/rel.json" > "$WORK/body.md"
+
+            if [ "$draft" = "true" ] && [ "$INCLUDE_DRAFT" != "true" ]; then
+              log "跳过 draft release：$tag"
+              continue
+            fi
+
+            # --- 保证 tag / 标题 / 说明 / 标记 与上游一致 ---
+            if GH_TOKEN="$SYNC_TOKEN" gh release view "$tag" --repo "$REPO" < /dev/null > /dev/null 2>&1; then
+              args=("$tag" --repo "$REPO" --title "$title" --notes-file "$WORK/body.md")
+              if [ "$prerelease" = "true" ]; then args+=(--prerelease); else args+=(--prerelease=false); fi
+              if [ "$draft" = "true" ]; then args+=(--draft); else args+=(--draft=false); fi
+              GH_TOKEN="$SYNC_TOKEN" gh release edit "${args[@]}" < /dev/null || log "警告：元数据更新失败：$tag"
+              updated_releases=$((updated_releases + 1))
+            else
+              args=("$tag" --repo "$REPO" --title "$title" --notes-file "$WORK/body.md" --target "$TARGET_BRANCH")
+              if [ "$prerelease" = "true" ]; then args+=(--prerelease); fi
+              if [ "$draft" = "true" ]; then args+=(--draft); fi
+              if ! GH_TOKEN="$SYNC_TOKEN" gh release create "${args[@]}" < /dev/null; then
+                log "错误：创建 release $tag 失败，跳过该 release 的附件"
+                continue
+              fi
+              created_releases=$((created_releases + 1))
+            fi
+
+            # --- 增量：已在目标 release 中上传完成的同名附件直接跳过 ---
+            : > "$WORK/existing.txt"
+            GH_TOKEN="$SYNC_TOKEN" gh release view "$tag" --repo "$REPO" --json assets \
+              --jq '.assets[] | select(.state == "uploaded") | .name' < /dev/null \
+              > "$WORK/existing.txt" 2>/dev/null || true
+
+            jq -r '.assets[]? | [(.id|tostring), (.size|tostring), .name] | @tsv' "$WORK/rel.json" > "$WORK/assets.tsv"
+            : > "$WORK/todo.tsv"
+            pending=0
+            while IFS=$'\t' read -r aid asize aname <&4; do
+              [ -z "${aid:-}" ] && continue
+              if grep -Fqx -- "$aname" "$WORK/existing.txt"; then
+                record SKIP "$tag" "$aname" "$asize" "目标 release 已存在同名附件"
+                continue
+              fi
+              printf '%s\t%s\t%s\n' "$aid" "$asize" "$aname" >> "$WORK/todo.tsv"
+              pending=$((pending + 1))
+            done 4< "$WORK/assets.tsv"
+
+            if [ "$pending" -eq 0 ]; then
+              log "Release $tag 无新增附件"
+              continue
+            fi
+            log "Release $tag：待同步附件 $pending 个，并发 $PARALLEL"
+
+            # --- 并发下载/上传（附件级并行，release 之间严格按版本顺序串行）---
+            pids=()
+            while IFS=$'\t' read -r aid asize aname <&4; do
+              [ -z "${aid:-}" ] && continue
+              handle_asset "$tag" "$aid" "$asize" "$aname" &
+              pids+=("$!")
+              if [ "${#pids[@]}" -ge "$PARALLEL" ]; then
+                wait -n || true
+                new_pids=()
+                for p in "${pids[@]}"; do
+                  if kill -0 "$p" 2>/dev/null; then new_pids+=("$p"); fi
+                done
+                if [ ${#new_pids[@]} -gt 0 ]; then pids=("${new_pids[@]}"); else pids=(); fi
+              fi
+            done 4< "$WORK/todo.tsv"
+            wait || true
+
+            rm -rf "$ASSET_DIR"; mkdir -p "$ASSET_DIR"   # 每个 release 处理完彻底清场
+            log "Release $tag 处理完成，剩余磁盘：$(hsize "$(avail_bytes)")"
+          done 3< "$WORK/tags.txt"
+
+          # ---------- 汇总 ----------
+          ok_n=$(awk -F'\t' '$1=="OK"'   "$RESULT_LOG" | wc -l | tr -d ' ')
+          sk_n=$(awk -F'\t' '$1=="SKIP"' "$RESULT_LOG" | wc -l | tr -d ' ')
+          fa_n=$(awk -F'\t' '$1=="FAIL"' "$RESULT_LOG" | wc -l | tr -d ' ')
+          ok_bytes=$(awk -F'\t' '$1=="OK" {s+=$4} END {print s+0}' "$RESULT_LOG")
+
+          {
+            echo "## 上游同步结果"
+            echo ""
+            echo "| 项目 | 数量 |"
+            echo "| --- | --- |"
+            echo "| 上游 release 总数 | $total_releases |"
+            echo "| 新建 release | $created_releases |"
+            echo "| 更新 release 元数据 | $updated_releases |"
+            echo "| 成功同步附件 | $ok_n（$(hsize "$ok_bytes")） |"
+            echo "| 跳过附件 | $sk_n |"
+            echo "| 失败附件 | $fa_n |"
+            echo ""
+            echo "上游仓库：\`$UPSTREAM\`　并发数：\`$PARALLEL\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$fa_n" -gt 0 ]; then
+            echo "失败明细：" >> "$GITHUB_STEP_SUMMARY"
+            awk -F'\t' '$1=="FAIL" {print "- `"$2"` / `"$3"`："$5}' "$RESULT_LOG" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$sk_n" -gt 0 ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "跳过明细：" >> "$GITHUB_STEP_SUMMARY"
+            awk -F'\t' '$1=="SKIP" {print "- `"$2"` / `"$3"`："$5}' "$RESULT_LOG" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          log "完成：成功 $ok_n / 跳过 $sk_n / 失败 $fa_n"
+          df -h "$RUNNER_TEMP" || true
+
+          if [ "$fa_n" -gt 0 ]; then
+            echo "::warning::有 $fa_n 个附件同步失败，详见 Job Summary"
+          fi

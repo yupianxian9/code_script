@@ -1,0 +1,102 @@
+name: 下载文件并上传到 Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: >
+          JSON 字符串数组，每个元素为下载链接。
+          示例：["https://example.com/file.zip", "https://example.com/setup.exe"]
+        required: true
+        type: string
+      tag:
+        description: '目标 Release 的 tag（如 v1.7），不存在则自动创建'
+        required: true
+        type: string
+        default: 'latest'
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载并上传所有文件
+        shell: bash
+        env:
+          URLS_JSON: ${{ github.event.inputs.urls }}
+          TAG: ${{ github.event.inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # 清理 Windows 换行符
+          export URLS_JSON="$(printf '%s' "$URLS_JSON" | tr -d '\r')"
+
+          # 移除 JSON 末尾多余逗号
+          export URLS_JSON="$(printf '%s' "$URLS_JSON" | sed -Ez 's/,\s*(]|})/\1/g')"
+
+          COUNT=$(jq -n 'env.URLS_JSON | fromjson | length')
+          echo "共有 ${COUNT} 个下载任务"
+
+          # 确保 release 存在
+          if ! gh release view "${TAG}" &>/dev/null; then
+            echo "创建 release: ${TAG}"
+            gh release create "${TAG}" --title "${TAG}" --notes "自动下载上传"
+          else
+            echo "release ${TAG} 已存在，将上传文件"
+          fi
+
+          for ((idx=0; idx<COUNT; idx++)); do
+            echo "========================================="
+            echo ">>> 任务 $((idx+1))/${COUNT}"
+
+            (
+              set -euo pipefail
+
+              URL=$(jq -rn --argjson i "$idx" 'env.URLS_JSON | fromjson | .[$i]')
+              if [[ -z "$URL" ]]; then
+                echo "错误：空链接，跳过"
+                exit 0
+              fi
+
+              # 从 URL 提取文件名：去除查询参数，取最后一段路径，若为空则用 download
+              filename="$(basename "${URL%%\?*}" || true)"
+              if [[ -z "$filename" ]]; then
+                filename="download"
+              fi
+              # 清理可能的 \r
+              filename="$(printf '%s' "$filename" | tr -d '\r')"
+              echo "文件名：$filename"
+
+              TASK_DIR=$(mktemp -d -t dl-XXXXX)
+              echo "临时目录：$TASK_DIR"
+              cleanup() { echo "清理 $TASK_DIR"; rm -rf "$TASK_DIR"; }
+              trap cleanup EXIT
+
+              cd "$TASK_DIR"
+
+              # 下载
+              echo "下载：$URL"
+              for i in 1 2 3; do
+                if curl -fsSL --retry 2 -o "$filename" "$URL"; then
+                  echo "下载成功"
+                  break
+                else
+                  echo "重试 $i ..."
+                  sleep 5
+                fi
+              done
+              [[ -f "$filename" ]] || { echo "下载失败"; exit 1; }
+
+              # 上传
+              echo "上传到 release ${TAG}..."
+              gh release upload "${TAG}" "$filename" --clobber
+
+              echo "任务完成：$filename"
+            ) || echo "⚠️ 任务 $idx 失败，继续下一个"
+          done
+
+          echo "所有任务处理完毕"

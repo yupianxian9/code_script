@@ -1,0 +1,74 @@
+/* ===================================
+   典雅风 - 完整版
+==================================== */
+body {
+  margin: 0;
+  padding: 0;
+  color: #333;
+  line-height: 1.6;
+}
+
+p {
+  text-indent: 2em;
+  margin: 0 0 0.7em;
+}
+
+h1 {
+  text-align: center;
+  font-size: 1.6em;
+  font-weight: normal;
+  color: #2a2a2a;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  border-top: 1px solid #555;
+  border-bottom: 1px solid #555;
+  padding: 0.5em 0;
+  margin: 1.5em 0 1em;
+}
+
+h2 {
+  text-align: center;
+  font-size: 1.4em;
+  font-weight: bold;
+  color: #3a3a3a;
+  letter-spacing: 0.1em;
+  border-bottom: 1px solid #888;
+  padding-bottom: 0.3em;
+  margin: 1.2em 0 0.6em;
+
+  /* ===== 新增：强制 h2 在新页开始 ===== */
+  break-before: page;
+  page-break-before: always;
+  margin-top: 0.5em; /* 分页后顶部留白稍小，更紧凑 */
+}
+
+h3 {
+  text-align: center;
+  font-size: 1.2em;
+  font-weight: normal;
+  color: #4a4a4a;
+  font-variant: small-caps;
+  letter-spacing: 0.05em;
+  margin: 1em 0 0.5em;
+
+  /* ===== 新增：强制 h3 在新页开始 ===== */
+  break-before: page;
+  page-break-before: always;
+  margin-top: 0.5em;
+}
+
+blockquote {
+  margin: 1.5em 2em;
+  border-left: 3px double #aaa;
+  background: #f8f8f8;
+  padding: 0.8em 1em;
+  color: #555;
+}
+
+img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 1.5em auto;
+  border: none;
+}

@@ -1,0 +1,117 @@
+/* ===================================
+   活泼绚丽风格 - 柔和版
+==================================== */
+
+body {
+  margin: 0;
+  padding: 0;
+  color: #3a3a3a;
+  line-height: 1.7;
+  background: #fffef9;
+}
+
+/* ========== 段落 ========== */
+p {
+  text-indent: 2em;
+  margin: 0 0 0.8em;
+  text-align: justify;
+}
+
+/* ========== 一级标题：紫粉渐变，白色文字 ========== */
+h1 {
+  text-align: center;
+  font-size: 1.6em;         
+  font-weight: bold;
+  color: #fff;
+  padding: 0.6em 1em;
+  margin: 1em 0 0.8em;
+  border-radius: 16px;
+  background-color: #a18cd1;
+  background-image: linear-gradient(to right, #a18cd1, #fbc2eb);
+  text-shadow: 1px 1px 3px rgba(0,0,0,0.2);
+  box-shadow: 0 4px 8px rgba(0,0,0,0.08);
+}
+
+/* ========== 二级标题：柔和淡彩渐变，深色文字 ========== */
+h2 {
+  text-align: left;
+  font-size: 1.4em;         
+  font-weight: bold;
+  color: #333;
+  padding: 0.4em 0.8em;
+  margin: 1.2em 0 0.6em;
+  border-radius: 10px;
+  background-color: #fec5bb;
+  background-image: linear-gradient(135deg, #fec5bb 0%, #fcd5ce 40%, #e8e8ff 100%);
+  box-shadow: 0 4px 10px rgba(0,0,0,0.06);
+  text-shadow: none;
+
+  /* ===== 新增：强制 h2 在新页开始 ===== */
+  break-before: page;
+  /* 为兼容旧阅读器，同时保留旧属性 */
+  page-break-before: always;
+  /* 分页后顶部可能会留白过多，减小上边距（可选） */
+  margin-top: 0.5em;
+}
+
+/* ========== 三级标题：渐变左边框装饰 ========== */
+h3 {
+  position: relative;
+  text-align: left;
+  font-size: 1.2em;          
+  font-weight: 600;
+  color: #444;
+  padding-left: 0.8em;
+  margin: 1em 0 0.5em;
+  border-left: 4px solid #ff6b6b;
+
+  /* ===== 新增：强制 h3 在新页开始 ===== */
+  break-before: page;
+  page-break-before: always;
+  margin-top: 0.5em;
+}
+h3::before {
+  content: "";
+  position: absolute;
+  left: -4px;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  border-radius: 2px;
+  background-color: #ff6b6b;
+  background-image: linear-gradient(to bottom, #ff6b6b, #feca57);
+}
+
+/* ========== 引用块 ========== */
+blockquote {
+  position: relative;
+  margin: 1.5em 2em;
+  padding: 1em 1.2em 1em 1.5em;
+  border-radius: 10px;
+  background-color: #f5f0ff;
+  background-image: linear-gradient(135deg, rgba(255,107,107,0.08), rgba(72,219,251,0.08));
+  border-left: 5px solid #ff6b6b;
+  color: #555;
+  font-style: italic;
+}
+blockquote::before {
+  content: "";
+  position: absolute;
+  left: -5px;
+  top: 0;
+  bottom: 0;
+  width: 5px;
+  border-radius: 2px 0 0 2px;
+  background-color: #ff6b6b;
+  background-image: linear-gradient(to bottom, #ff6b6b, #feca57);
+}
+
+/* ========== 图片 ========== */
+img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 1.5em auto;
+  border-radius: 12px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+}
